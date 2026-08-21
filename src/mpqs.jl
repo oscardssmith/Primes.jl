@@ -626,11 +626,6 @@ function _siqs_sieve!(sieve::Vector{UInt8}, sieve_len::Int,
         o1 = offset1[j]
         o1 < 0 && continue   # p | a and 2b ≡ 0 (mod p): no root at all
 
-        # Each root gets the same plain stride walk. Interleaving the two walks into one
-        # loop was measurably worse above 40 digits (0.93-0.98x): the streams are already
-        # independent, so the core overlaps them across separate loops anyway, while the
-        # joint `pos1 <= && pos2 <=` gate costs a compare per iteration on the small
-        # primes that dominate the write count.
         _sieve_stride!(sieve, sieve_len, o1 + 1, p, logp)
         # o2 == o1 is exactly the p | a single-root case, which must not be subtracted
         # twice. The offsets are always written as a pair, so o2 >= 0 follows from o1 >= 0.
