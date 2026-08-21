@@ -23,9 +23,8 @@ large_prime > 0, large_prime2 == 0: single large prime partial
 large_prime > 0, large_prime2 > 0: double large prime partial (large_prime < large_prime2)
 """
 struct SmoothRelation
-    # ax + b, reduced mod n once the relation is kept. Always a BigInt: combining two
-    # partials multiplies these mod n, which needs the full width of n even when the
-    # polynomial arithmetic itself runs in a fixed-width type.
+    # ax + b, reduced mod n. BigInt regardless of the working type: combining partials
+    # multiplies two of these mod n.
     ax_plus_b::BigInt
     exponents::BitVector # parity of exponents over factor base
     full_exp::Vector{Int32} # actual exponent counts of g(x) over factor base
@@ -302,10 +301,9 @@ Returns a SmoothRelation or nothing.
             return SmoothRelation(mod(BigInt(ax_b), n_orig), copy(exponents), copy(full_exp), a_indices, lp, 0)
         end
     elseif remainder <= dlp_bound_sq && remainder > 1 && !isprime(Int(remainder))
-        # Double large prime: try to split composite remainder into two primes.
-        # remainder ≤ dlp_bound_sq < typemax(Int), so this stays in machine arithmetic.
-        # `eachfactor` rather than `lenstrafactor` directly: the remainder can be a prime
-        # power or have a small factor, cases where ECM alone spins and eventually throws.
+        # Double large prime: split the composite remainder, which is ≤ dlp_bound_sq and
+        # so fits an Int. `eachfactor` rather than `lenstrafactor`, which throws on the
+        # prime powers and small factors that turn up here.
         r = Int(remainder)
         f = first(first(eachfactor(r)))
         p1 = Int(min(f, div(r, f)))
@@ -464,63 +462,52 @@ function _split_off_multiplier(g::BigInt, n_orig::BigInt, k::Int)
 end
 
 """
-Generate SIQS `a` value and CRT components for multiple b-values.
-Returns (a, a_indices, B_components) where B_components[j] is the CRT contribution
-from the j-th prime factor of a. This allows generating 2^(s-1) b-values.
+Pick an `a` for the next batch of polynomials, as a product of `s` factor base primes.
+Returns (a, a_indices, B_components), or nothing if no unused `a` was found.
 """
 function _generate_siqs_a(::Type{T}, ctx::MPQSContext, used_a_sets::Set{Vector{Int}}) where {T<:Integer}
     fb = ctx.factor_base
     fb_size = ctx.fb_size
-    kn = ctx.n
-    target_a = isqrt(2 * kn) ÷ ctx.sieve_interval
+    target_a = isqrt(2 * ctx.n) ÷ ctx.sieve_interval
 
-    lo = max(5, fb_size ÷ 3)
-    hi = fb_size
-    typical_log_p = log(Float64(fb[div(lo + hi, 2)]))
-    num_facs = max(2, round(Int, log(Float64(target_a)) / typical_log_p))
-    num_facs_range = max(2, num_facs - 1):min(fb_size ÷ 2, num_facs + 1)
+    # Sieve yield falls off sharply either side of target_a, so `a` is built to hit it:
+    # draw s-1 primes near target_a^(1/s), then let the factor base pick the last.
+    # s is the smallest the factor base allows, keeping `a`'s primes large — larger s
+    # gives more polynomials per setup but spends smaller primes, and a prime dividing
+    # `a` sieves at one root instead of two.
+    log_target = log(Float64(target_a))
+    s = max(2, ceil(Int, log_target / log(Float64(fb[fb_size]))))
+    center = searchsortedfirst(fb, round(Int, exp(log_target / s)))
+    lo = clamp(center - fb_size ÷ 8, 2, fb_size - s + 1)
+    hi = clamp(center + fb_size ÷ 8, lo + s - 1, fb_size)
 
-    best_a = BigInt(0)
-    best_indices = Int[]
-    best_diff = BigInt(10)^200
-
-    for _ in 1:100
-        nf = rand(num_facs_range)
-        indices = sort(rand(lo:hi, nf))
-        length(unique(indices)) == nf || continue
-        indices = unique(indices)
+    for _ in 1:20
+        indices = unique(sort(rand(lo:hi, s - 1)))
+        length(indices) == s - 1 || continue
+        partial = prod(BigInt(fb[i]) for i in indices)
+        last = searchsortedfirst(fb, target_a ÷ partial)
+        # Clamping instead would put `a` far off target, so drop the draw.
+        (2 <= last <= fb_size && last ∉ indices) || continue
+        push!(indices, last)
         sort!(indices)
-        length(indices) == nf || continue
         indices in used_a_sets && continue
 
-        a = prod(BigInt(fb[i]) for i in indices)
-        diff = abs(a - target_a)
-        if diff < best_diff
-            best_diff = diff
-            best_a = a
-            best_indices = indices
-        end
+        push!(used_a_sets, indices)
+        a = partial * fb[last]
+        return (T(a), indices, _crt_components(T, a, indices, fb, ctx.sqrt_kn_mod))
     end
+    return nothing
+end
 
-    isempty(best_indices) && return nothing
-    push!(used_a_sets, best_indices)
-
-    a = best_a
-    s = length(best_indices)
-
-    # Compute CRT components B_j via Hensel lifting:
-    # For each prime q_j | a, B_j = sqrt(kn) mod q_j * (a/q_j) * inv(a/q_j, q_j) mod a
-    # Selection runs in BigInt (once per a-value); the results drop into T for the sieve.
-    B_components = Vector{T}(undef, s)
-    for (j, idx) in enumerate(best_indices)
+# B_j = √(kn) mod q_j · (a/q_j) · inv(a/q_j, q_j) mod a, one per prime q_j of `a`.
+# Summing them under every choice of sign gives the 2^(s-1) roots of b² ≡ kn (mod a).
+function _crt_components(::Type{T}, a::BigInt, indices::Vector{Int},
+                         fb::Vector{Int}, sqrt_kn_mod::Vector{Int}) where {T<:Integer}
+    return map(indices) do idx
         q = BigInt(fb[idx])
-        r = ctx.sqrt_kn_mod[idx]
         a_div_q = a ÷ q
-        inv_a_q = invmod(mod(a_div_q, q), q)
-        B_components[j] = T(mod(r * a_div_q * inv_a_q, a))
+        T(mod(sqrt_kn_mod[idx] * a_div_q * invmod(mod(a_div_q, q), q), a))
     end
-
-    return (T(a), best_indices, B_components)
 end
 
 """
@@ -629,9 +616,8 @@ function _siqs_collect!(a::T, b::T, c::T, a_factors::Vector{Int}, ctx::MPQSConte
     body_len = num_chunks * 8
     chunks = reinterpret(UInt64, @view sieve[1:body_len])
 
-    # Scan 8 bytes at a time: a chunk with no high bit set holds no candidate, which
-    # is the overwhelmingly common case. The tail past the last whole chunk is scanned
-    # byte by byte by giving it a first-position of `body_len + 1` and no chunk test.
+    # Scan 8 bytes at a time; a chunk with no high bit set holds no candidate, which is
+    # the common case. The final iteration covers the tail, with no chunk test.
     @inbounds for j in 1:(num_chunks + 1)
         if j <= num_chunks
             chunks[j] & 0x8080808080808080 == 0 && continue
@@ -662,8 +648,8 @@ Process a single sieve candidate at position `i`.
                              relations::Vector{SmoothRelation},
                              partial_relations::Dict{Int, SmoothRelation}) where {T<:Integer}
     x = T(i - M - 1)
-    # g(x) = Q(x)/a = a·x² + 2b·x + c, by Horner. Evaluating g directly keeps every
-    # intermediate at g's own width — forming Q(x) = (ax+b)² - kn would need twice that.
+    # g(x) = Q(x)/a by Horner. Evaluating g directly keeps every intermediate at g's
+    # width; forming Q(x) = (ax+b)² - kn would need twice that.
     gx = (a * x + 2 * b) * x + c
     iszero(gx) && return
     ax_b = a * x + b
@@ -679,16 +665,12 @@ Process a single sieve candidate at position `i`.
 end
 
 """
-File a freshly found relation.
+File a relation: smooth ones go into the pool, partials are combined with a stored
+relation sharing a large prime, or parked to wait for one.
 
-Fully smooth relations go straight into the pool. A partial is combined with a
-stored relation sharing one of its large primes, if one is waiting, and otherwise
-parked under its own first large prime to wait for a partner.
-
-Note the two readings of `large_prime`: on a *fresh* relation it marks a prime
-that is still unfactored, so the relation is unusable; on a relation returned by
-`_combine_partials` it names the prime that cancelled to a square, so the relation
-*is* usable and `large_prime2` is what decides. Hence the asymmetry below.
+`large_prime` reads two ways, which is why the checks below are asymmetric: on a
+fresh relation it is an unfactored prime, so the relation is unusable; on one from
+`_combine_partials` it cancelled to a square, so only `large_prime2` matters.
 """
 function _store_relation!(relation::SmoothRelation,
                           relations::Vector{SmoothRelation},
@@ -734,23 +716,18 @@ end
 """
     mpqs_factor(n::Integer) -> BigInt
 
-Factor `n` using the Self-Initializing Quadratic Sieve (SIQS variant of MPQS).
-Uses constant sieve initialization, unclamped subtraction, small prime skipping,
-and incremental Gray code root updates for performance.
-Returns a non-trivial factor of `n`.
+Return a non-trivial factor of `n` using the Self-Initializing Quadratic Sieve
+(SIQS variant of MPQS), which requires `n` composite and not a perfect power.
 
-The polynomial arithmetic runs in the narrowest type that provably holds it: the
-largest intermediate is Horner's `(a·x + 2b)·x` at roughly `M·√(2kn)`, so anything
-that fits in 126 bits is sieved in `Int128` rather than `BigInt`. Only the mod-`n`
-steps — combining partials and extracting the factor — need `n`'s full width.
+Polynomial arithmetic runs in the narrowest type that holds it. The largest
+intermediate is Horner's `(a·x + 2b)·x` at roughly `M·√(2kn)`, so anything fitting
+126 bits sieves in `Int128`; only the mod-`n` steps need `n`'s full width.
 """
 function mpqs_factor(n::Integer)
     nb = BigInt(n)
-    # Relation collection runs until it splits n, so an input MPQS cannot split has to
-    # be refused here rather than looped on forever. A prime has no split; a perfect
-    # power p^e has one, but the congruence x² ≡ y² (mod p^e) is not reliable at
-    # finding it — factor the root instead. `eachfactor` rules out both before it ever
-    # reaches MPQS, so these guard against direct misuse.
+    # Relation collection runs until it splits n, so anything MPQS cannot split must be
+    # refused rather than looped on. A prime has no split, and x² ≡ y² (mod p^e) does
+    # not reliably find one for a perfect power. `eachfactor` excludes both already.
     nb > 3 || throw(ArgumentError("mpqs_factor needs n > 3, got $n"))
     isprime(nb) && throw(ArgumentError("mpqs_factor needs a composite n, got the prime $n"))
     ispower(nb) && throw(ArgumentError("mpqs_factor cannot reliably split the perfect power $n; factor its root"))
@@ -813,16 +790,14 @@ function _mpqs_factor(::Type{T}, n::BigInt, k::Int, kn::BigInt,
     dlp_bound = p_max * 100
     dlp_bound_sq = dlp_bound * dlp_bound
 
-    # Preallocated Gray-code root deltas, one row per prime factor of `a`. The number
-    # of factors `_generate_siqs_a` picks grows with n, so the row count is a floor,
-    # not a bound — grow it rather than indexing past the end.
+    # Gray-code root deltas, one row per prime factor of `a`. s grows with n, so this
+    # count is a starting size, not a bound.
     B_delta = [Vector{Int}(undef, actual_fb_size) for _ in 1:10]
     inv_a = Vector{Int}(undef, actual_fb_size)
 
-    # Sieve until the relation matrix yields a factor. There is deliberately no cap on
-    # the number of a-values: for a composite non-prime-power (the caller's precondition)
-    # relations keep accumulating and a dependency eventually splits n, so any cap could
-    # only turn a slow factorization into a spurious failure.
+    # Sieve until the relation matrix yields a factor. No cap on a-values: given the
+    # preconditions above a dependency eventually splits n, so a cap could only turn a
+    # slow factorization into a spurious failure.
     while true
         if length(relations) >= target_relations
             dependencies = _gf2_eliminate([r.exponents for r in relations])
@@ -880,9 +855,8 @@ function _mpqs_factor(::Type{T}, n::BigInt, k::Int, kn::BigInt,
         if mod(widemul(b, b), a) != mod(kn, a)
             b = a - b
         end
-        # c = (b² - kn)/a is ≈ M·√(kn/2) and so fits T, but b² alone is ~2kn/M² and
-        # does not — hence widemul, which widens Int128 to BigInt. Once per polynomial
-        # against a whole sieve pass, so the promotion costs nothing measurable.
+        # c ≈ M·√(kn/2) fits T, but b² alone does not — hence widemul. Once per
+        # polynomial against a whole sieve pass, so the promotion is free.
         c = T(div(widemul(b, b) - kn, a))
 
         # Compute initial roots (once per a)
