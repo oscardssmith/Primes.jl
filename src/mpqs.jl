@@ -37,14 +37,6 @@ end
 # A polynomial is the triple (a, b, c) in the working type `T`, where
 # c = (b² - kn) / a, so that g(x) = Q(x)/a = a·x² + 2b·x + c can be evaluated
 # without ever forming Q(x) = (ax + b)² - kn itself.
-#
-# c = (b² - kn) / a. |c| ≈ M·√(kn/2) so the result fits T, but b² alone is ~2kn/M²
-# and would overflow it — so the intermediate is formed in BigInt and narrowed after.
-# Once per polynomial, against a full sieve pass, so the promotion is free.
-function _poly_c(::Type{T}, b::Integer, kn::BigInt, a_big::BigInt) where {T<:Integer}
-    bb = BigInt(b)
-    return T(div(bb * bb - kn, a_big))
-end
 
 # Precomputed table: digit count → (fb_size, sieve_interval)
 # Ref: Silverman (1987), Crandall & Pomerance (2005) Ch.6
@@ -832,7 +824,6 @@ function _mpqs_factor(::Type{T}, n::BigInt, k::Int, kn::BigInt,
         while length(B_delta) < s
             push!(B_delta, Vector{Int}(undef, actual_fb_size))
         end
-        a_big = BigInt(a)   # only for the b² - kn computation, which overflows T
 
         # Precompute inv(a) mod p using factored form (avoids GMP BigInt mod)
         # a = prod(factor_base[idx] for idx in a_indices)
@@ -867,10 +858,13 @@ function _mpqs_factor(::Type{T}, n::BigInt, k::Int, kn::BigInt,
 
         # Initial b (all positive CRT signs)
         b = mod(sum(B_comps), a)
-        if mod(BigInt(b) * BigInt(b), a_big) != mod(kn, a_big)
+        if mod(widemul(b, b), a) != mod(kn, a)
             b = a - b
         end
-        c = _poly_c(T, b, kn, a_big)
+        # c = (b² - kn)/a is ≈ M·√(kn/2) and so fits T, but b² alone is ~2kn/M² and
+        # does not — hence widemul, which widens Int128 to BigInt. Once per polynomial
+        # against a whole sieve pass, so the promotion costs nothing measurable.
+        c = T(div(widemul(b, b) - kn, a))
 
         # Compute initial roots (once per a)
         _compute_siqs_roots!(offset1, offset2, b, c, inv_a,
@@ -923,7 +917,7 @@ function _mpqs_factor(::Type{T}, n::BigInt, k::Int, kn::BigInt,
             end
 
             # Recompute roots for primes dividing a (~s primes)
-            c = _poly_c(T, b, kn, a_big)
+            c = T(div(widemul(b, b) - kn, a))
             for idx in a_indices
                 p = factor_base[idx]
                 b2_mod_p = mod(2 * Int(mod(b, p)), p)
