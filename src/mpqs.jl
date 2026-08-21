@@ -7,14 +7,12 @@
 """
 Context for MPQS factorization.
 """
-mutable struct MPQSContext
+struct MPQSContext
     n::BigInt           # kn (multiplied)
     n_orig::BigInt      # original n
-    k::Int              # Knuth multiplier
     factor_base::Vector{Int}
     fb_size::Int
     sqrt_kn_mod::Vector{Int}
-    log_primes::Vector{UInt8}
     sieve_interval::Int
 end
 
@@ -36,18 +34,10 @@ struct SmoothRelation
     large_prime2::Int    # second unfactored prime (0 if single LP or smooth)
 end
 
-"""
-Represents an MPQS polynomial Q(x) = (ax + b)² - kn, in the working type `T`.
-`c = (b² - kn) / a`, so g(x) = Q(x)/a = a·x² + 2b·x + c is evaluated without
-ever forming Q(x) itself.
-"""
-struct MPQSPolynomial{T<:Integer}
-    a::T
-    b::T
-    c::T
-    a_factors::Vector{Int}  # indices into factor base for primes composing a
-end
-
+# A polynomial is the triple (a, b, c) in the working type `T`, where
+# c = (b² - kn) / a, so that g(x) = Q(x)/a = a·x² + 2b·x + c can be evaluated
+# without ever forming Q(x) = (ax + b)² - kn itself.
+#
 # c = (b² - kn) / a. |c| ≈ M·√(kn/2) so the result fits T, but b² alone is ~2kn/M²
 # and would overflow it — so the intermediate is formed in BigInt and narrowed after.
 # Once per polynomial, against a full sieve pass, so the promotion is free.
@@ -370,10 +360,13 @@ function _combine_partials(r1::SmoothRelation, r2::SmoothRelation,
 end
 
 """
-GF(2) Gaussian elimination on parity vectors (fallback for small matrices).
-Returns dependency sets (indices that XOR to zero).
+    _gf2_eliminate(relations) -> Vector{Vector{Int}}
+
+GF(2) Gaussian elimination on parity vectors. Returns dependency sets (indices
+that XOR to zero). For the matrix sizes MPQS reaches (up to ~10K) plain Gaussian
+elimination beats Block Lanczos on overhead.
 """
-function _gf2_eliminate_gaussian(relations::Vector{BitVector}, fb_size::Int)::Vector{Vector{Int}}
+function _gf2_eliminate(relations::Vector{BitVector})::Vector{Vector{Int}}
     nrels = length(relations)
     nrels == 0 && return Vector{Int}[]
 
@@ -407,17 +400,6 @@ function _gf2_eliminate_gaussian(relations::Vector{BitVector}, fb_size::Int)::Ve
         end
     end
     return dependencies
-end
-
-"""
-    _gf2_eliminate(relations, fb_size) -> Vector{Vector{Int}}
-
-Find GF(2) dependencies using Gaussian elimination.
-For the matrix sizes encountered in MPQS (up to ~10K), Gaussian elimination
-is faster than Block Lanczos due to lower overhead.
-"""
-function _gf2_eliminate(relations::Vector{BitVector}, fb_size::Int)::Vector{Vector{Int}}
-    return _gf2_eliminate_gaussian(relations, fb_size)
 end
 
 """
@@ -469,29 +451,24 @@ function _extract_factor(n_orig::BigInt, kn::BigInt, k::Int,
         end
     end
 
-    g = gcd(abs(x - y), n_orig)
-    if g > 1 && g < n_orig
-        g2 = gcd(g, BigInt(k))
-        if g2 > 1 && g2 < g
-            g = div(g, g2)
-        end
-        if g > 1 && g < n_orig && mod(n_orig, g) == 0
-            return g
-        end
+    # x ≡ ±y (mod n) is the useless case; either sign of the difference can be the
+    # one that splits n, so try both.
+    for d in (x - y, x + y)
+        g = _split_off_multiplier(gcd(abs(d), n_orig), n_orig, k)
+        g === nothing || return g
     end
-
-    g = gcd(abs(x + y), n_orig)
-    if g > 1 && g < n_orig
-        g2 = gcd(g, BigInt(k))
-        if g2 > 1 && g2 < g
-            g = div(g, g2)
-        end
-        if g > 1 && g < n_orig && mod(n_orig, g) == 0
-            return g
-        end
-    end
-
     return nothing
+end
+
+# A gcd that is divisible by the Knuth multiplier is a factor of kn, not of n;
+# divide k back out and keep the result only if it really divides n.
+function _split_off_multiplier(g::BigInt, n_orig::BigInt, k::Int)
+    1 < g < n_orig || return nothing
+    g2 = gcd(g, BigInt(k))
+    if 1 < g2 < g
+        g = div(g, g2)
+    end
+    return (1 < g < n_orig && iszero(mod(n_orig, g))) ? g : nothing
 end
 
 """
@@ -564,7 +541,7 @@ function _compute_siqs_roots!(offset1::Vector{Int}, offset2::Vector{Int},
                                inv_a::Vector{Int},
                                sqrt_kn_mod::Vector{Int},
                                factor_base::Vector{Int},
-                               fb_size::Int, M::Int, a_indices::Vector{Int}) where {T<:Integer}
+                               fb_size::Int, M::Int) where {T<:Integer}
     @inbounds for j in 1:fb_size
         p = factor_base[j]
         if inv_a[j] == 0
@@ -649,47 +626,32 @@ end
 Collect smooth candidates from sieve. Candidates are positions where the sieve
 value underflowed (>= 0x80), indicating sufficient factorization over the factor base.
 """
-function _siqs_collect!(poly::MPQSPolynomial{T}, ctx::MPQSContext,
+function _siqs_collect!(a::T, b::T, c::T, a_factors::Vector{Int}, ctx::MPQSContext,
                         sieve::Vector{UInt8}, starts1::Vector{Int}, starts2::Vector{Int},
                         relations::Vector{SmoothRelation},
                         partial_relations::Dict{Int, SmoothRelation},
                         M::Int, large_prime_bound::Int, dlp_bound::Int, dlp_bound_sq::Int,
                         tf_exponents::BitVector, tf_full_exp::Vector{Int32}) where {T<:Integer}
-    a, b, c = poly.a, poly.b, poly.c
     sieve_len = length(sieve)
-
-    # Vectorized sieve scanning: process 8 bytes at a time via reinterpret
     num_chunks = div(sieve_len, 8)
     body_len = num_chunks * 8
+    chunks = reinterpret(UInt64, @view sieve[1:body_len])
 
-    if num_chunks > 0
-        sieve_body = @view sieve[1:body_len]
-        sieve_chunks = reinterpret(UInt64, sieve_body)
-
-        @inbounds for j in 1:num_chunks
-            chunk = sieve_chunks[j]
-            # The bitmask trick: check if any of the 8 bytes have the high bit set
-            if chunk & 0x8080808080808080 != 0
-                for k in 1:8
-                    idx = (j - 1) * 8 + k
-                    if sieve[idx] >= 0x80
-                        _process_candidate!(idx, a, b, c, M, ctx,
-                                            large_prime_bound, dlp_bound, dlp_bound_sq,
-                                            starts1, starts2, poly.a_factors,
-                                            tf_exponents, tf_full_exp,
-                                            relations, partial_relations)
-                    end
-                end
-            end
+    # Scan 8 bytes at a time: a chunk with no high bit set holds no candidate, which
+    # is the overwhelmingly common case. The tail past the last whole chunk is scanned
+    # byte by byte by giving it a first-position of `body_len + 1` and no chunk test.
+    @inbounds for j in 1:(num_chunks + 1)
+        if j <= num_chunks
+            chunks[j] & 0x8080808080808080 == 0 && continue
+            first_pos, last_pos = (j - 1) * 8 + 1, j * 8
+        else
+            first_pos, last_pos = body_len + 1, sieve_len
         end
-    end
-
-    # Handle the tail (remaining 1 to 7 bytes that didn't fit in a UInt64)
-    @inbounds for i in (body_len + 1):sieve_len
-        if sieve[i] >= 0x80
+        for i in first_pos:last_pos
+            sieve[i] < 0x80 && continue
             _process_candidate!(i, a, b, c, M, ctx,
                                 large_prime_bound, dlp_bound, dlp_bound_sq,
-                                starts1, starts2, poly.a_factors,
+                                starts1, starts2, a_factors,
                                 tf_exponents, tf_full_exp,
                                 relations, partial_relations)
         end
@@ -721,76 +683,59 @@ Process a single sieve candidate at position `i`.
                                     tf_exponents, tf_full_exp)
     relation === nothing && return
 
-    if relation.large_prime == 0 && relation.large_prime2 == 0
-        # Fully smooth
+    _store_relation!(relation, relations, partial_relations, ctx)
+end
+
+"""
+File a freshly found relation.
+
+Fully smooth relations go straight into the pool. A partial is combined with a
+stored relation sharing one of its large primes, if one is waiting, and otherwise
+parked under its own first large prime to wait for a partner.
+
+Note the two readings of `large_prime`: on a *fresh* relation it marks a prime
+that is still unfactored, so the relation is unusable; on a relation returned by
+`_combine_partials` it names the prime that cancelled to a square, so the relation
+*is* usable and `large_prime2` is what decides. Hence the asymmetry below.
+"""
+function _store_relation!(relation::SmoothRelation,
+                          relations::Vector{SmoothRelation},
+                          partial_relations::Dict{Int, SmoothRelation},
+                          ctx::MPQSContext)
+    lp1, lp2 = relation.large_prime, relation.large_prime2
+    if lp1 == 0
         push!(relations, relation)
-    elseif relation.large_prime2 == 0
-        # Single large prime partial
-        lp = relation.large_prime
-        if haskey(partial_relations, lp)
-            other = partial_relations[lp]
-            combined = _combine_partials(relation, other, lp, ctx)
-            if combined !== nothing
-                if combined.large_prime2 == 0
-                    push!(relations, combined)
-                end
-                # If combined still has 2 LPs, discard (too complex to chain)
-            end
-            delete!(partial_relations, lp)
-        else
-            partial_relations[lp] = relation
+        return
+    end
+
+    key = haskey(partial_relations, lp1) ? lp1 :
+          (lp2 != 0 && haskey(partial_relations, lp2)) ? lp2 : 0
+    if key == 0
+        partial_relations[lp1] = relation
+        return
+    end
+
+    other = partial_relations[key]
+    delete!(partial_relations, key)
+    combined = _combine_partials(relation, other, key, ctx)
+    combined === nothing && return
+
+    if combined.large_prime2 == 0
+        push!(relations, combined)
+        return
+    end
+
+    # One large prime still unpaired: chain it once more, or park it.
+    rest = combined.large_prime2
+    if haskey(partial_relations, rest)
+        other2 = partial_relations[rest]
+        delete!(partial_relations, rest)
+        combined2 = _combine_partials(combined, other2, rest, ctx)
+        if combined2 !== nothing && combined2.large_prime2 == 0
+            push!(relations, combined2)
         end
     else
-        # Double large prime partial — try to combine with existing single partials
-        lp1, lp2 = relation.large_prime, relation.large_prime2
-        if haskey(partial_relations, lp1)
-            other = partial_relations[lp1]
-            combined = _combine_partials(relation, other, lp1, ctx)
-            delete!(partial_relations, lp1)
-            if combined !== nothing
-                if combined.large_prime2 == 0
-                    # Fully resolved — push as full relation
-                    push!(relations, combined)
-                else
-                    # One remaining LP — store as single-LP partial
-                    remaining_lp = combined.large_prime2
-                    if haskey(partial_relations, remaining_lp)
-                        other2 = partial_relations[remaining_lp]
-                        combined2 = _combine_partials(combined, other2, remaining_lp, ctx)
-                        if combined2 !== nothing && combined2.large_prime2 == 0
-                            push!(relations, combined2)
-                        end
-                        delete!(partial_relations, remaining_lp)
-                    else
-                        partial_relations[remaining_lp] = combined
-                    end
-                end
-            end
-        elseif haskey(partial_relations, lp2)
-            other = partial_relations[lp2]
-            combined = _combine_partials(relation, other, lp2, ctx)
-            delete!(partial_relations, lp2)
-            if combined !== nothing
-                if combined.large_prime2 == 0
-                    push!(relations, combined)
-                else
-                    remaining_lp = combined.large_prime2
-                    if haskey(partial_relations, remaining_lp)
-                        other2 = partial_relations[remaining_lp]
-                        combined2 = _combine_partials(combined, other2, remaining_lp, ctx)
-                        if combined2 !== nothing && combined2.large_prime2 == 0
-                            push!(relations, combined2)
-                        end
-                        delete!(partial_relations, remaining_lp)
-                    else
-                        partial_relations[remaining_lp] = combined
-                    end
-                end
-            end
-        else
-            # Store indexed by smaller LP for future matching
-            partial_relations[lp1] = relation
-        end
+        partial_relations[rest] = combined
     end
 end
 
@@ -823,8 +768,7 @@ function _mpqs_factor(::Type{T}, n::BigInt, k::Int, kn::BigInt,
     factor_base, sqrt_kn_mod, log_primes = _build_factor_base(kn, fb_size_target)
     actual_fb_size = length(factor_base)
 
-    ctx = MPQSContext(kn, n, k, factor_base, actual_fb_size,
-                      sqrt_kn_mod, log_primes, sieve_interval)
+    ctx = MPQSContext(kn, n, factor_base, actual_fb_size, sqrt_kn_mod, sieve_interval)
 
     relations = SmoothRelation[]
     partial_relations = Dict{Int, SmoothRelation}()
@@ -872,9 +816,10 @@ function _mpqs_factor(::Type{T}, n::BigInt, k::Int, kn::BigInt,
     max_a_values = 5000
     done = false
 
-    # Preallocate B_delta arrays (reused across a-values)
-    max_s = 10
-    B_delta = [Vector{Int}(undef, actual_fb_size) for _ in 1:max_s]
+    # Preallocated Gray-code root deltas, one row per prime factor of `a`. The number
+    # of factors `_generate_siqs_a` picks grows with n, so the row count is a floor,
+    # not a bound — grow it rather than indexing past the end.
+    B_delta = [Vector{Int}(undef, actual_fb_size) for _ in 1:10]
     inv_a = Vector{Int}(undef, actual_fb_size)
 
     for _ in 1:max_a_values
@@ -884,6 +829,9 @@ function _mpqs_factor(::Type{T}, n::BigInt, k::Int, kn::BigInt,
         result === nothing && continue
         a, a_indices, B_comps = result
         s = length(a_indices)
+        while length(B_delta) < s
+            push!(B_delta, Vector{Int}(undef, actual_fb_size))
+        end
         a_big = BigInt(a)   # only for the b² - kn computation, which overflows T
 
         # Precompute inv(a) mod p using factored form (avoids GMP BigInt mod)
@@ -926,13 +874,12 @@ function _mpqs_factor(::Type{T}, n::BigInt, k::Int, kn::BigInt,
 
         # Compute initial roots (once per a)
         _compute_siqs_roots!(offset1, offset2, b, c, inv_a,
-                              sqrt_kn_mod, factor_base, actual_fb_size, M, a_indices)
+                              sqrt_kn_mod, factor_base, actual_fb_size, M)
 
         # First polynomial
         _siqs_sieve!(sieve, sieve_len, offset1, offset2, starts1, starts2,
                      factor_base, log_primes, actual_fb_size, sieve_start_idx, log_init)
-        poly = MPQSPolynomial(a, b, c, a_indices)
-        _siqs_collect!(poly, ctx, sieve, starts1, starts2,
+        _siqs_collect!(a, b, c, a_indices, ctx, sieve, starts1, starts2,
                        relations, partial_relations, M, large_prime_bound,
                        dlp_bound, dlp_bound_sq,
                        tf_exponents, tf_full_exp)
@@ -994,8 +941,7 @@ function _mpqs_factor(::Type{T}, n::BigInt, k::Int, kn::BigInt,
             # Sieve and collect
             _siqs_sieve!(sieve, sieve_len, offset1, offset2, starts1, starts2,
                          factor_base, log_primes, actual_fb_size, sieve_start_idx, log_init)
-            poly = MPQSPolynomial(a, b, c, a_indices)
-            _siqs_collect!(poly, ctx, sieve, starts1, starts2,
+            _siqs_collect!(a, b, c, a_indices, ctx, sieve, starts1, starts2,
                            relations, partial_relations, M, large_prime_bound,
                            dlp_bound, dlp_bound_sq,
                            tf_exponents, tf_full_exp)
@@ -1013,7 +959,7 @@ function _mpqs_factor(::Type{T}, n::BigInt, k::Int, kn::BigInt,
 
     # GF(2) elimination
     parity_vectors = [r.exponents for r in relations]
-    dependencies = _gf2_eliminate(parity_vectors, actual_fb_size)
+    dependencies = _gf2_eliminate(parity_vectors)
 
     # Try each dependency to find a non-trivial factor
     for dep in dependencies
