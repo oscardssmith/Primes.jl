@@ -746,6 +746,14 @@ steps — combining partials and extracting the factor — need `n`'s full width
 """
 function mpqs_factor(n::Integer)
     nb = BigInt(n)
+    # Relation collection runs until it splits n, so an input MPQS cannot split has to
+    # be refused here rather than looped on forever. A prime has no split; a perfect
+    # power p^e has one, but the congruence x² ≡ y² (mod p^e) is not reliable at
+    # finding it — factor the root instead. `eachfactor` rules out both before it ever
+    # reaches MPQS, so these guard against direct misuse.
+    nb > 3 || throw(ArgumentError("mpqs_factor needs n > 3, got $n"))
+    isprime(nb) && throw(ArgumentError("mpqs_factor needs a composite n, got the prime $n"))
+    ispower(nb) && throw(ArgumentError("mpqs_factor cannot reliably split the perfect power $n; factor its root"))
     k = _select_knuth_multiplier(nb)
     kn = BigInt(k) * nb
     fb_size_target, sieve_interval = _mpqs_select_params(nb)
@@ -805,17 +813,28 @@ function _mpqs_factor(::Type{T}, n::BigInt, k::Int, kn::BigInt,
     dlp_bound = p_max * 100
     dlp_bound_sq = dlp_bound * dlp_bound
 
-    max_a_values = 5000
-    done = false
-
     # Preallocated Gray-code root deltas, one row per prime factor of `a`. The number
     # of factors `_generate_siqs_a` picks grows with n, so the row count is a floor,
     # not a bound — grow it rather than indexing past the end.
     B_delta = [Vector{Int}(undef, actual_fb_size) for _ in 1:10]
     inv_a = Vector{Int}(undef, actual_fb_size)
 
-    for _ in 1:max_a_values
-        done && break
+    # Sieve until the relation matrix yields a factor. There is deliberately no cap on
+    # the number of a-values: for a composite non-prime-power (the caller's precondition)
+    # relations keep accumulating and a dependency eventually splits n, so any cap could
+    # only turn a slow factorization into a spurious failure.
+    while true
+        if length(relations) >= target_relations
+            dependencies = _gf2_eliminate([r.exponents for r in relations])
+            for dep in dependencies
+                result = _extract_factor(n, kn, k, dep, relations, factor_base)
+                result === nothing || return result
+            end
+            # Every dependency gave x ≡ ±y (mod n) and so a trivial gcd. Each further
+            # relation adds another dependency, each independently splitting n with
+            # probability ≥ 1/2, so collect more rather than giving up.
+            target_relations = length(relations) + 50
+        end
 
         result = _generate_siqs_a(T, ctx, used_a_sets)
         result === nothing && continue
@@ -878,9 +897,8 @@ function _mpqs_factor(::Type{T}, n::BigInt, k::Int, kn::BigInt,
                        dlp_bound, dlp_bound_sq,
                        tf_exponents, tf_full_exp)
 
-        if length(relations) >= target_relations
-            break
-        end
+        # Enough relations: hand back to the top of the loop, which runs the elimination.
+        length(relations) >= target_relations && continue
 
         # Remaining b-values via Gray code incremental root update
         num_b = 1 << (s - 1)
@@ -940,28 +958,7 @@ function _mpqs_factor(::Type{T}, n::BigInt, k::Int, kn::BigInt,
                            dlp_bound, dlp_bound_sq,
                            tf_exponents, tf_full_exp)
 
-            if length(relations) >= target_relations
-                done = true
-                break
-            end
+            length(relations) >= target_relations && break
         end
     end
-
-    if length(relations) < actual_fb_size + 1
-        error("failed to factor $n: insufficient smooth relations ($(length(relations)) found, need $(actual_fb_size + 1))")
-    end
-
-    # GF(2) elimination
-    parity_vectors = [r.exponents for r in relations]
-    dependencies = _gf2_eliminate(parity_vectors)
-
-    # Try each dependency to find a non-trivial factor
-    for dep in dependencies
-        result = _extract_factor(n, kn, k, dep, relations, factor_base)
-        if result !== nothing
-            return result
-        end
-    end
-
-    error("failed to factor $n")
 end
