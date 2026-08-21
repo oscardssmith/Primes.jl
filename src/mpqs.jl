@@ -25,8 +25,10 @@ large_prime > 0, large_prime2 == 0: single large prime partial
 large_prime > 0, large_prime2 > 0: double large prime partial (large_prime < large_prime2)
 """
 struct SmoothRelation
-    ax_plus_b::BigInt    # ax + b
-    Q_val::BigInt        # Q(x) = (ax+b)² - kn
+    # ax + b, reduced mod n once the relation is kept. Always a BigInt: combining two
+    # partials multiplies these mod n, which needs the full width of n even when the
+    # polynomial arithmetic itself runs in a fixed-width type.
+    ax_plus_b::BigInt
     exponents::BitVector # parity of exponents over factor base
     full_exp::Vector{Int32} # actual exponent counts of g(x) over factor base
     a_indices::Vector{Int}  # FB indices of primes composing polynomial `a`
@@ -35,12 +37,23 @@ struct SmoothRelation
 end
 
 """
-Represents an MPQS polynomial Q(x) = (ax + b)² - kn.
+Represents an MPQS polynomial Q(x) = (ax + b)² - kn, in the working type `T`.
+`c = (b² - kn) / a`, so g(x) = Q(x)/a = a·x² + 2b·x + c is evaluated without
+ever forming Q(x) itself.
 """
-struct MPQSPolynomial
-    a::BigInt
-    b::BigInt
+struct MPQSPolynomial{T<:Integer}
+    a::T
+    b::T
+    c::T
     a_factors::Vector{Int}  # indices into factor base for primes composing a
+end
+
+# c = (b² - kn) / a. |c| ≈ M·√(kn/2) so the result fits T, but b² alone is ~2kn/M²
+# and would overflow it — so the intermediate is formed in BigInt and narrowed after.
+# Once per polynomial, against a full sieve pass, so the promotion is free.
+function _poly_c(::Type{T}, b::Integer, kn::BigInt, a_big::BigInt) where {T<:Integer}
+    bb = BigInt(b)
+    return T(div(bb * bb - kn, a_big))
 end
 
 # Precomputed table: digit count → (fb_size, sieve_interval)
@@ -104,7 +117,7 @@ function _select_knuth_multiplier(n::BigInt)::Int
         score = 0.0
 
         # Special handling for p=2
-        kn_mod8 = Int(_mpz_fdiv_ui(kn, UInt(8)))
+        kn_mod8 = Int(mod(kn, 8))
         if kn_mod8 == 1
             score += 2 * log(2.0)
         elseif kn_mod8 == 5
@@ -136,7 +149,7 @@ end
 Build factor base: primes p where Legendre(kn, p) == 1, plus p=2.
 Also computes sqrt(kn) mod p and log₂(p) for each prime.
 """
-function _build_factor_base(kn::BigInt, fb_size_target::Int)
+function _build_factor_base(kn::Integer, fb_size_target::Int)
     factor_base = Int[2]
     sqrt_kn_mod = Int[mod(kn, 2) == 0 ? 0 : 1]
 
@@ -144,8 +157,8 @@ function _build_factor_base(kn::BigInt, fb_size_target::Int)
     while length(factor_base) < fb_size_target
         if isprime(p) && powermod(kn, div(p - 1, 2), p) == 1
             push!(factor_base, p)
-            # Compute sqrt(kn) mod p using Tonelli-Shanks (result < p, fits in Int)
-            push!(sqrt_kn_mod, Int(_tonelli_shanks(mod(kn, p), p)))
+            # kn mod p fits in an Int, so the root is found in machine arithmetic
+            push!(sqrt_kn_mod, _tonelli_shanks(Int(mod(kn, p)), p))
         end
         p += 2
     end
@@ -159,10 +172,10 @@ end
 Tonelli-Shanks algorithm for computing square root mod p.
 Returns r such that r² ≡ n (mod p).
 """
-function _tonelli_shanks(n::BigInt, p::Int)::BigInt
+function _tonelli_shanks(n::Int, p::Int)::Int
     n = mod(n, p)
-    n == 0 && return BigInt(0)
-    p == 2 && return BigInt(n)
+    n == 0 && return 0
+    p == 2 && return n
 
     # Factor out powers of 2 from p-1
     q = p - 1
@@ -174,19 +187,19 @@ function _tonelli_shanks(n::BigInt, p::Int)::BigInt
 
     if s == 1
         # p ≡ 3 (mod 4)
-        return powermod(BigInt(n), div(p + 1, 4), p)
+        return powermod(n, div(p + 1, 4), p)
     end
 
     # Find a non-residue z
-    z = BigInt(2)
+    z = 2
     while powermod(z, div(p - 1, 2), p) != p - 1
         z += 1
     end
 
     M = s
     c = powermod(z, q, p)
-    t = powermod(BigInt(n), q, p)
-    R = powermod(BigInt(n), div(q + 1, 2), p)
+    t = powermod(n, q, p)
+    R = powermod(n, div(q + 1, 2), p)
 
     while true
         t == 1 && return R
@@ -194,147 +207,36 @@ function _tonelli_shanks(n::BigInt, p::Int)::BigInt
         i = 0
         temp = t
         while temp != 1
-            temp = mod(temp * temp, p)
+            temp = Int(mod(widemul(temp, temp), p))
             i += 1
         end
-        b = powermod(c, BigInt(1) << (M - i - 1), p)
+        b = powermod(c, 1 << (M - i - 1), p)
         M = i
-        c = mod(b * b, p)
-        t = mod(t * c, p)
-        R = mod(R * b, p)
+        c = Int(mod(widemul(b, b), p))
+        t = Int(mod(widemul(t, c), p))
+        R = Int(mod(widemul(R, b), p))
     end
 end
 
 """
-Generate an MPQS polynomial Q(x) = (ax+b)² - kn.
-`a` is a product of factor base primes, chosen so that a ≈ √(2kn)/M.
-"""
-function _generate_polynomial(ctx::MPQSContext, used_a_sets::Set{Vector{Int}})::Union{MPQSPolynomial, Nothing}
-    fb = ctx.factor_base
-    fb_size = ctx.fb_size
-    kn = ctx.n
-    target_a = isqrt(2 * kn) ÷ ctx.sieve_interval
-
-    # Determine how many primes we need based on target_a and typical prime size
-    # Use primes from the upper portion of the factor base
-    # Start search from position fb_size/3 to fb_size (avoid very small primes)
-    lo = max(5, fb_size ÷ 3)
-    hi = fb_size
-
-    # Estimate number of factors needed: target_a / prod(typical_prime)
-    typical_log_p = log(Float64(fb[div(lo + hi, 2)]))
-    num_facs = max(2, round(Int, log(Float64(target_a)) / typical_log_p))
-    # Allow ±1 variation
-    num_facs_range = max(2, num_facs - 1):min(fb_size ÷ 2, num_facs + 1)
-
-    best_a = BigInt(0)
-    best_indices = Int[]
-    best_diff = BigInt(10)^200
-
-    for _ in 1:100
-        nf = rand(num_facs_range)
-        indices = sort(rand(lo:hi, nf))
-        length(unique(indices)) == nf || continue
-        indices = unique(indices)
-        sort!(indices)
-        length(indices) == nf || continue
-        indices in used_a_sets && continue
-
-        a = prod(BigInt(fb[i]) for i in indices)
-        diff = abs(a - target_a)
-        if diff < best_diff
-            best_diff = diff
-            best_a = a
-            best_indices = indices
-        end
-    end
-
-    isempty(best_indices) && return nothing
-    push!(used_a_sets, best_indices)
-
-    a = best_a
-    # Compute b using CRT: b² ≡ kn (mod a)
-    b = _compute_b(kn, a, best_indices, fb, ctx.sqrt_kn_mod)
-
-    return MPQSPolynomial(a, b, best_indices)
-end
-
-"""
-Compute b such that b² ≡ kn (mod a) using CRT from factor base roots.
-"""
-function _compute_b(kn::BigInt, a::BigInt, a_indices::Vector{Int},
-                    fb::Vector{Int}, sqrt_kn_mod::Vector{Int})::BigInt
-    # Use CRT to combine sqrt(kn) mod p_i for each prime in a
-    b = BigInt(0)
-    for idx in a_indices
-        p = BigInt(fb[idx])
-        r = sqrt_kn_mod[idx]
-        a_div_p = a ÷ p
-        # CRT: b += r * a/p * invmod(a/p, p) mod a
-        inv_a_p = invmod(mod(a_div_p, p), p)
-        b = mod(b + r * a_div_p * inv_a_p, a)
-    end
-    # Ensure b² ≡ kn (mod a); if not, try a-b
-    if mod(b * b, a) != mod(kn, a)
-        b = a - b
-    end
-    return b
-end
-
-
-"""
-In-place unsigned integer division: sets x = x ÷ d, returns remainder.
-Uses GMP's mpz_tdiv_q_ui for single-call quotient+remainder.
-"""
-function _tdiv_q_ui!(x::BigInt, d::UInt)::UInt
-    return ccall((:__gmpz_tdiv_q_ui, :libgmp), Culong,
-                 (Ref{BigInt}, Ref{BigInt}, Culong), x, x, d)
-end
-
-"""
-In-place absolute value: sets x = |x|.
-"""
-function _mpz_abs!(x::BigInt, src::BigInt)
-    ccall((:__gmpz_abs, :libgmp), Cvoid, (Ref{BigInt}, Ref{BigInt}), x, src)
-end
-
-"""
-Compute quotient into `q` and return remainder, without modifying `n`.
-Uses GMP's mpz_tdiv_q_ui: sets q = n ÷ d, returns n mod d.
-"""
-function _tdiv_q_ui_into!(q::BigInt, n::BigInt, d::UInt)::UInt
-    return ccall((:__gmpz_tdiv_q_ui, :libgmp), Culong,
-                 (Ref{BigInt}, Ref{BigInt}, Culong), q, n, d)
-end
-
-"""
-Compute n mod d without allocating a BigInt for the result.
-Returns the remainder as a Culong (UInt). Uses GMP's mpz_fdiv_ui.
-"""
-function _mpz_fdiv_ui(n::BigInt, d::Culong)::Culong
-    return ccall((:__gmpz_fdiv_ui, :libgmp), Culong, (Ref{BigInt}, Culong), n, d)
-end
-
-"""
-Root-guided trial factoring with preallocated buffers.
+Root-guided trial factoring of g(x), which is held in the working type `T`.
 `exponents` and `full_exp` are zeroed and filled in-place to avoid allocation.
-`remainder` is a preallocated BigInt used as scratch space.
-Returns a SmoothRelation (copying the buffers) or nothing.
+Returns a SmoothRelation or nothing.
 """
-@inline function _trial_factor_guided(ax_b::BigInt, gx::BigInt, Qx::BigInt, ctx::MPQSContext,
+@inline function _trial_factor_guided(ax_b::T, gx::T, n_orig::BigInt, ctx::MPQSContext,
                                large_prime_bound::Int, dlp_bound::Int, dlp_bound_sq::Int,
                                sieve_pos::Int,
                                starts1::Vector{Int}, starts2::Vector{Int},
                                a_indices::Vector{Int},
-                               exponents::BitVector, full_exp::Vector{Int32},
-                               remainder::BigInt, quotient_buf::BigInt)::Union{SmoothRelation, Nothing}
+                               exponents::BitVector, full_exp::Vector{Int32}
+                               )::Union{SmoothRelation, Nothing} where {T<:Integer}
     fb = ctx.factor_base
     fb_size = ctx.fb_size
 
     # Reset buffers
     fill!(exponents, false)
     fill!(full_exp, Int32(0))
-    _mpz_abs!(remainder, gx)
+    remainder = abs(gx)
 
     if gx < 0
         exponents[1] = true
@@ -344,25 +246,25 @@ Returns a SmoothRelation (copying the buffers) or nothing.
     early_exit_j = fb_size + 1  # sentinel: no early exit
     @inbounds for j in 1:fb_size
         p = fb[j]
-        p_ui = UInt(p)
+        pT = T(p)
         s1 = starts1[j]
         if s1 == 0
             # Prime with no stored sieve position — brute force check
-            r = _tdiv_q_ui_into!(quotient_buf, remainder, p_ui)
-            if r == 0
+            q, r = divrem(remainder, pT)
+            if iszero(r)
                 cnt = Int32(1)
-                remainder, quotient_buf = quotient_buf, remainder
+                remainder = q
                 while true
-                    r = _tdiv_q_ui_into!(quotient_buf, remainder, p_ui)
-                    r != 0 && break
+                    q, r = divrem(remainder, pT)
+                    iszero(r) || break
                     cnt += Int32(1)
-                    remainder, quotient_buf = quotient_buf, remainder
+                    remainder = q
                 end
                 full_exp[j + 1] = cnt
                 exponents[j + 1] = isodd(cnt)
                 if isone(remainder)
                     break
-                elseif remainder < p * p
+                elseif remainder < pT * pT
                     early_exit_j = j
                     break
                 end
@@ -379,16 +281,16 @@ Returns a SmoothRelation (copying the buffers) or nothing.
         # p divides g(x) — extract all powers
         cnt = Int32(0)
         while true
-            r = _tdiv_q_ui_into!(quotient_buf, remainder, p_ui)
-            r != 0 && break
+            q, r = divrem(remainder, pT)
+            iszero(r) || break
             cnt += Int32(1)
-            remainder, quotient_buf = quotient_buf, remainder
+            remainder = q
         end
         full_exp[j + 1] = cnt
         exponents[j + 1] = isodd(cnt)
         if isone(remainder)
             break
-        elseif remainder < p * p
+        elseif remainder < pT * pT
             early_exit_j = j
             break
         end
@@ -401,7 +303,7 @@ Returns a SmoothRelation (copying the buffers) or nothing.
         if idx <= fb_size && fb[idx] == rem_int
             full_exp[idx + 1] += Int32(1)
             exponents[idx + 1] ⊻= true
-            Base.GMP.MPZ.set_si!(remainder, 1)
+            remainder = one(T)
         end
     end
 
@@ -409,28 +311,25 @@ Returns a SmoothRelation (copying the buffers) or nothing.
         exponents[ai + 1] ⊻= true
     end
 
+    # A relation is kept rarely enough that promoting ax+b to a BigInt here costs nothing.
     if isone(remainder)
-        axb_copy = BigInt(); Base.GMP.MPZ.set!(axb_copy, ax_b)
-        qx_copy = BigInt(); Base.GMP.MPZ.set!(qx_copy, Qx)
-        return SmoothRelation(axb_copy, qx_copy, copy(exponents), copy(full_exp), a_indices, 0, 0)
+        return SmoothRelation(mod(BigInt(ax_b), n_orig), copy(exponents), copy(full_exp), a_indices, 0, 0)
     elseif remainder <= large_prime_bound && remainder > 1
         lp = Int(remainder)
         if isprime(lp)
-            axb_copy = BigInt(); Base.GMP.MPZ.set!(axb_copy, ax_b)
-            qx_copy = BigInt(); Base.GMP.MPZ.set!(qx_copy, Qx)
-            return SmoothRelation(axb_copy, qx_copy, copy(exponents), copy(full_exp), a_indices, lp, 0)
+            return SmoothRelation(mod(BigInt(ax_b), n_orig), copy(exponents), copy(full_exp), a_indices, lp, 0)
         end
     elseif remainder <= dlp_bound_sq && remainder > 1 && !isprime(Int(remainder))
-        # Double large prime: try to split composite remainder into two primes
-        f = pollardfactor(remainder)
-        if f !== nothing
-            p1 = Int(min(f, div(remainder, f)))
-            p2 = Int(max(f, div(remainder, f)))
-            if p1 > 1 && p2 > 1 && p1 <= dlp_bound && p2 <= dlp_bound && isprime(p1) && isprime(p2)
-                axb_copy = BigInt(); Base.GMP.MPZ.set!(axb_copy, ax_b)
-                qx_copy = BigInt(); Base.GMP.MPZ.set!(qx_copy, Qx)
-                return SmoothRelation(axb_copy, qx_copy, copy(exponents), copy(full_exp), a_indices, p1, p2)
-            end
+        # Double large prime: try to split composite remainder into two primes.
+        # remainder ≤ dlp_bound_sq < typemax(Int), so this stays in machine arithmetic.
+        # `eachfactor` rather than `lenstrafactor` directly: the remainder can be a prime
+        # power or have a small factor, cases where ECM alone spins and eventually throws.
+        r = Int(remainder)
+        f = first(first(eachfactor(r)))
+        p1 = Int(min(f, div(r, f)))
+        p2 = Int(max(f, div(r, f)))
+        if p1 > 1 && p2 > 1 && p1 <= dlp_bound && p2 <= dlp_bound && isprime(p1) && isprime(p2)
+            return SmoothRelation(mod(BigInt(ax_b), n_orig), copy(exponents), copy(full_exp), a_indices, p1, p2)
         end
     end
 
@@ -448,7 +347,6 @@ function _combine_partials(r1::SmoothRelation, r2::SmoothRelation,
     combined_full = r1.full_exp .+ r2.full_exp
     combined_a_indices = vcat(r1.a_indices, r2.a_indices)
     combined_axb = mod(r1.ax_plus_b * r2.ax_plus_b, ctx.n_orig)
-    combined_Q = r1.Q_val * r2.Q_val
 
     # Collect remaining LPs (those that aren't the shared one)
     remaining = Int[]
@@ -461,10 +359,10 @@ function _combine_partials(r1::SmoothRelation, r2::SmoothRelation,
     # The shared LP appears in both relations, so its product is lp^2 (even exponent).
     # We track it for square root computation.
     if isempty(remaining)
-        return SmoothRelation(combined_axb, combined_Q, combined_exp, combined_full,
+        return SmoothRelation(combined_axb, combined_exp, combined_full,
                               combined_a_indices, shared_lp, 0)
     elseif length(remaining) == 1
-        return SmoothRelation(combined_axb, combined_Q, combined_exp, combined_full,
+        return SmoothRelation(combined_axb, combined_exp, combined_full,
                               combined_a_indices, shared_lp, remaining[1])
     end
     # Two or more remaining LPs — can't use directly as a full relation
@@ -601,7 +499,7 @@ Generate SIQS `a` value and CRT components for multiple b-values.
 Returns (a, a_indices, B_components) where B_components[j] is the CRT contribution
 from the j-th prime factor of a. This allows generating 2^(s-1) b-values.
 """
-function _generate_siqs_a(ctx::MPQSContext, used_a_sets::Set{Vector{Int}})
+function _generate_siqs_a(::Type{T}, ctx::MPQSContext, used_a_sets::Set{Vector{Int}}) where {T<:Integer}
     fb = ctx.factor_base
     fb_size = ctx.fb_size
     kn = ctx.n
@@ -643,53 +541,35 @@ function _generate_siqs_a(ctx::MPQSContext, used_a_sets::Set{Vector{Int}})
 
     # Compute CRT components B_j via Hensel lifting:
     # For each prime q_j | a, B_j = sqrt(kn) mod q_j * (a/q_j) * inv(a/q_j, q_j) mod a
-    B_components = Vector{BigInt}(undef, s)
+    # Selection runs in BigInt (once per a-value); the results drop into T for the sieve.
+    B_components = Vector{T}(undef, s)
     for (j, idx) in enumerate(best_indices)
         q = BigInt(fb[idx])
         r = ctx.sqrt_kn_mod[idx]
         a_div_q = a ÷ q
         inv_a_q = invmod(mod(a_div_q, q), q)
-        B_components[j] = mod(r * a_div_q * inv_a_q, a)
+        B_components[j] = T(mod(r * a_div_q * inv_a_q, a))
     end
 
-    return (a, best_indices, B_components)
+    return (T(a), best_indices, B_components)
 end
 
 """
-Precompute inv(a) mod p for each factor base prime (done once per a value).
-"""
-function _precompute_inv_a(a::BigInt, factor_base::Vector{Int})::Vector{Int}
-    fb_size = length(factor_base)
-    inv_a = Vector{Int}(undef, fb_size)
-    @inbounds for j in 1:fb_size
-        p = factor_base[j]
-        a_mod_p = Int(_mpz_fdiv_ui(a, UInt(p)))
-        if a_mod_p == 0
-            inv_a[j] = 0  # p divides a
-        else
-            inv_a[j] = invmod(a_mod_p, p)
-        end
-    end
-    return inv_a
-end
-
-"""
-Compute initial sieve root offsets from b (requires BigInt mod, done once per a-value).
+Compute initial sieve root offsets from b, once per a-value.
 offset1[j], offset2[j] ∈ [0, p-1]: sieve positions are offset+1, offset+1+p, ...
 Use -1 as sentinel for "no root" (p | a and 2b ≡ 0 mod p).
 """
 function _compute_siqs_roots!(offset1::Vector{Int}, offset2::Vector{Int},
-                               b::BigInt, a::BigInt, kn::BigInt,
+                               b::T, c::T,
                                inv_a::Vector{Int},
                                sqrt_kn_mod::Vector{Int},
                                factor_base::Vector{Int},
-                               fb_size::Int, M::Int, a_indices::Vector{Int})
-    c = div(b * b - kn, a)
+                               fb_size::Int, M::Int, a_indices::Vector{Int}) where {T<:Integer}
     @inbounds for j in 1:fb_size
         p = factor_base[j]
         if inv_a[j] == 0
-            b2_mod_p = mod(2 * Int(_mpz_fdiv_ui(b, UInt(p))), p)
-            c_mod_p = Int(_mpz_fdiv_ui(c, UInt(p)))
+            b2_mod_p = mod(2 * Int(mod(b, p)), p)
+            c_mod_p = Int(mod(c, p))
             if b2_mod_p == 0
                 offset1[j] = -1; offset2[j] = -1
             else
@@ -700,7 +580,7 @@ function _compute_siqs_roots!(offset1::Vector{Int}, offset2::Vector{Int},
             end
         else
             sqr = sqrt_kn_mod[j]
-            b_mod_p = Int(_mpz_fdiv_ui(b, UInt(p)))
+            b_mod_p = Int(mod(b, p))
             ai = inv_a[j]
             r1 = mod((sqr - b_mod_p) * ai, p)
             r2 = mod((-sqr - b_mod_p) * ai, p)
@@ -769,16 +649,13 @@ end
 Collect smooth candidates from sieve. Candidates are positions where the sieve
 value underflowed (>= 0x80), indicating sufficient factorization over the factor base.
 """
-function _siqs_collect!(poly::MPQSPolynomial, ctx::MPQSContext,
+function _siqs_collect!(poly::MPQSPolynomial{T}, ctx::MPQSContext,
                         sieve::Vector{UInt8}, starts1::Vector{Int}, starts2::Vector{Int},
                         relations::Vector{SmoothRelation},
                         partial_relations::Dict{Int, SmoothRelation},
                         M::Int, large_prime_bound::Int, dlp_bound::Int, dlp_bound_sq::Int,
-                        tf_exponents::BitVector, tf_full_exp::Vector{Int32},
-                        tf_remainder::BigInt, tf_quotient::BigInt,
-                        tf_ax_b::BigInt, tf_Qx::BigInt, tf_gx::BigInt)
-    a, b = poly.a, poly.b
-    kn = ctx.n
+                        tf_exponents::BitVector, tf_full_exp::Vector{Int32}) where {T<:Integer}
+    a, b, c = poly.a, poly.b, poly.c
     sieve_len = length(sieve)
 
     # Vectorized sieve scanning: process 8 bytes at a time via reinterpret
@@ -796,11 +673,10 @@ function _siqs_collect!(poly::MPQSPolynomial, ctx::MPQSContext,
                 for k in 1:8
                     idx = (j - 1) * 8 + k
                     if sieve[idx] >= 0x80
-                        _process_candidate!(idx, a, b, kn, M, ctx,
+                        _process_candidate!(idx, a, b, c, M, ctx,
                                             large_prime_bound, dlp_bound, dlp_bound_sq,
                                             starts1, starts2, poly.a_factors,
-                                            tf_exponents, tf_full_exp, tf_remainder, tf_quotient,
-                                            tf_ax_b, tf_Qx, tf_gx,
+                                            tf_exponents, tf_full_exp,
                                             relations, partial_relations)
                     end
                 end
@@ -811,11 +687,10 @@ function _siqs_collect!(poly::MPQSPolynomial, ctx::MPQSContext,
     # Handle the tail (remaining 1 to 7 bytes that didn't fit in a UInt64)
     @inbounds for i in (body_len + 1):sieve_len
         if sieve[i] >= 0x80
-            _process_candidate!(i, a, b, kn, M, ctx,
+            _process_candidate!(i, a, b, c, M, ctx,
                                 large_prime_bound, dlp_bound, dlp_bound_sq,
                                 starts1, starts2, poly.a_factors,
-                                tf_exponents, tf_full_exp, tf_remainder, tf_quotient,
-                                tf_ax_b, tf_Qx, tf_gx,
+                                tf_exponents, tf_full_exp,
                                 relations, partial_relations)
         end
     end
@@ -824,29 +699,26 @@ end
 """
 Process a single sieve candidate at position `i`.
 """
-@inline function _process_candidate!(i::Int, a::BigInt, b::BigInt, kn::BigInt, M::Int,
+@inline function _process_candidate!(i::Int, a::T, b::T, c::T, M::Int,
                              ctx::MPQSContext,
                              large_prime_bound::Int, dlp_bound::Int, dlp_bound_sq::Int,
                              starts1::Vector{Int}, starts2::Vector{Int},
                              a_factors::Vector{Int},
                              tf_exponents::BitVector, tf_full_exp::Vector{Int32},
-                             tf_remainder::BigInt, tf_quotient::BigInt,
-                             tf_ax_b::BigInt, tf_Qx::BigInt, tf_gx::BigInt,
                              relations::Vector{SmoothRelation},
-                             partial_relations::Dict{Int, SmoothRelation})
-    x = i - M - 1
-    Base.GMP.MPZ.mul_si!(tf_ax_b, a, x)
-    Base.GMP.MPZ.add!(tf_ax_b, b)
-    Base.GMP.MPZ.mul!(tf_Qx, tf_ax_b, tf_ax_b)
-    Base.GMP.MPZ.sub!(tf_Qx, kn)
-    iszero(tf_Qx) && return
-    Base.GMP.MPZ.tdiv_q!(tf_gx, tf_Qx, a)
+                             partial_relations::Dict{Int, SmoothRelation}) where {T<:Integer}
+    x = T(i - M - 1)
+    # g(x) = Q(x)/a = a·x² + 2b·x + c, by Horner. Evaluating g directly keeps every
+    # intermediate at g's own width — forming Q(x) = (ax+b)² - kn would need twice that.
+    gx = (a * x + 2 * b) * x + c
+    iszero(gx) && return
+    ax_b = a * x + b
 
-    relation = _trial_factor_guided(tf_ax_b, tf_gx, tf_Qx, ctx,
+    relation = _trial_factor_guided(ax_b, gx, ctx.n_orig, ctx,
                                     large_prime_bound, dlp_bound, dlp_bound_sq,
                                     i, starts1, starts2,
                                     a_factors,
-                                    tf_exponents, tf_full_exp, tf_remainder, tf_quotient)
+                                    tf_exponents, tf_full_exp)
     relation === nothing && return
 
     if relation.large_prime == 0 && relation.large_prime2 == 0
@@ -923,18 +795,31 @@ Process a single sieve candidate at position `i`.
 end
 
 """
-    mpqs_factor(n::BigInt) -> BigInt
+    mpqs_factor(n::Integer) -> BigInt
 
 Factor `n` using the Self-Initializing Quadratic Sieve (SIQS variant of MPQS).
 Uses constant sieve initialization, unclamped subtraction, small prime skipping,
 and incremental Gray code root updates for performance.
 Returns a non-trivial factor of `n`.
-"""
-function mpqs_factor(n::BigInt)::BigInt
-    k = _select_knuth_multiplier(n)
-    kn = BigInt(k) * n
 
-    fb_size_target, sieve_interval = _mpqs_select_params(n)
+The polynomial arithmetic runs in the narrowest type that provably holds it: the
+largest intermediate is Horner's `(a·x + 2b)·x` at roughly `M·√(2kn)`, so anything
+that fits in 126 bits is sieved in `Int128` rather than `BigInt`. Only the mod-`n`
+steps — combining partials and extracting the factor — need `n`'s full width.
+"""
+function mpqs_factor(n::Integer)
+    nb = BigInt(n)
+    k = _select_knuth_multiplier(nb)
+    kn = BigInt(k) * nb
+    fb_size_target, sieve_interval = _mpqs_select_params(nb)
+    width = ndigits(isqrt(2 * kn), base=2) + ndigits(sieve_interval, base=2) + 4
+    return width <= 126 ?
+        _mpqs_factor(Int128, nb, k, kn, fb_size_target, sieve_interval) :
+        _mpqs_factor(BigInt, nb, k, kn, fb_size_target, sieve_interval)
+end
+
+function _mpqs_factor(::Type{T}, n::BigInt, k::Int, kn::BigInt,
+                      fb_size_target::Int, sieve_interval::Int)::BigInt where {T<:Integer}
     factor_base, sqrt_kn_mod, log_primes = _build_factor_base(kn, fb_size_target)
     actual_fb_size = length(factor_base)
 
@@ -959,11 +844,6 @@ function mpqs_factor(n::BigInt)::BigInt
     # Preallocate trial factoring buffers (reused across all candidates)
     tf_exponents = falses(actual_fb_size + 1)
     tf_full_exp = zeros(Int32, actual_fb_size + 1)
-    tf_remainder = BigInt(0)
-    tf_quotient = BigInt(0)
-    tf_ax_b = BigInt(0)
-    tf_Qx = BigInt(0)
-    tf_gx = BigInt(0)
 
     # Constant sieve init: candidates are detected by UInt8 underflow (>= 0x80).
     # log_init calibrated to match reference implementation threshold.
@@ -1000,10 +880,11 @@ function mpqs_factor(n::BigInt)::BigInt
     for _ in 1:max_a_values
         done && break
 
-        result = _generate_siqs_a(ctx, used_a_sets)
+        result = _generate_siqs_a(T, ctx, used_a_sets)
         result === nothing && continue
         a, a_indices, B_comps = result
         s = length(a_indices)
+        a_big = BigInt(a)   # only for the b² - kn computation, which overflows T
 
         # Precompute inv(a) mod p using factored form (avoids GMP BigInt mod)
         # a = prod(factor_base[idx] for idx in a_indices)
@@ -1031,30 +912,30 @@ function mpqs_factor(n::BigInt)::BigInt
             delta = B_delta[v]
             @inbounds for j in 1:actual_fb_size
                 p = factor_base[j]
-                Bv_mod_p = Int(_mpz_fdiv_ui(Bv, UInt(p)))
+                Bv_mod_p = Int(mod(Bv, p))
                 delta[j] = mod(2 * Bv_mod_p * inv_a[j], p)
             end
         end
 
         # Initial b (all positive CRT signs)
         b = mod(sum(B_comps), a)
-        if mod(b * b, a) != mod(kn, a)
+        if mod(BigInt(b) * BigInt(b), a_big) != mod(kn, a_big)
             b = a - b
         end
+        c = _poly_c(T, b, kn, a_big)
 
-        # Compute initial roots (BigInt mod, once per a)
-        _compute_siqs_roots!(offset1, offset2, b, a, kn, inv_a,
+        # Compute initial roots (once per a)
+        _compute_siqs_roots!(offset1, offset2, b, c, inv_a,
                               sqrt_kn_mod, factor_base, actual_fb_size, M, a_indices)
 
         # First polynomial
         _siqs_sieve!(sieve, sieve_len, offset1, offset2, starts1, starts2,
                      factor_base, log_primes, actual_fb_size, sieve_start_idx, log_init)
-        poly = MPQSPolynomial(a, b, a_indices)
+        poly = MPQSPolynomial(a, b, c, a_indices)
         _siqs_collect!(poly, ctx, sieve, starts1, starts2,
                        relations, partial_relations, M, large_prime_bound,
                        dlp_bound, dlp_bound_sq,
-                       tf_exponents, tf_full_exp, tf_remainder, tf_quotient,
-                       tf_ax_b, tf_Qx, tf_gx)
+                       tf_exponents, tf_full_exp)
 
         if length(relations) >= target_relations
             break
@@ -1094,12 +975,12 @@ function mpqs_factor(n::BigInt)::BigInt
                 end
             end
 
-            # Recompute roots for primes dividing a (~s primes, needs BigInt)
-            c = div(b * b - kn, a)
+            # Recompute roots for primes dividing a (~s primes)
+            c = _poly_c(T, b, kn, a_big)
             for idx in a_indices
                 p = factor_base[idx]
-                b2_mod_p = mod(2 * Int(_mpz_fdiv_ui(b, UInt(p))), p)
-                c_mod_p = Int(_mpz_fdiv_ui(c, UInt(p)))
+                b2_mod_p = mod(2 * Int(mod(b, p)), p)
+                c_mod_p = Int(mod(c, p))
                 if b2_mod_p == 0
                     offset1[idx] = -1; offset2[idx] = -1
                 else
@@ -1113,12 +994,11 @@ function mpqs_factor(n::BigInt)::BigInt
             # Sieve and collect
             _siqs_sieve!(sieve, sieve_len, offset1, offset2, starts1, starts2,
                          factor_base, log_primes, actual_fb_size, sieve_start_idx, log_init)
-            poly = MPQSPolynomial(a, b, a_indices)
+            poly = MPQSPolynomial(a, b, c, a_indices)
             _siqs_collect!(poly, ctx, sieve, starts1, starts2,
                            relations, partial_relations, M, large_prime_bound,
                            dlp_bound, dlp_bound_sq,
-                           tf_exponents, tf_full_exp, tf_remainder, tf_quotient,
-                           tf_ax_b, tf_Qx, tf_gx)
+                           tf_exponents, tf_full_exp)
 
             if length(relations) >= target_relations
                 done = true
