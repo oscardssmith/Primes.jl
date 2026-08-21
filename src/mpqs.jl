@@ -62,7 +62,7 @@ const _MPQS_PARAMS = [
 """
 Select MPQS parameters (factor base size, sieve interval) based on digit count.
 """
-function _mpqs_select_params(n::BigInt)
+function _mpqs_select_params(n)
     d = ndigits(n)
     # Find bracketing entries and interpolate
     if d <= _MPQS_PARAMS[1].digits
@@ -88,7 +88,7 @@ Select optimal Knuth multiplier for MPQS.
 Scores k ∈ {1,3,5,...,47} using Silverman's formula.
 Ref: Silverman (1987) §4
 """
-function _select_knuth_multiplier(n::BigInt)::Int
+function _select_knuth_multiplier(n)::Int
     best_k = 1
     best_score = -Inf
     small_primes = primes(200)
@@ -207,7 +207,7 @@ Returns a SmoothRelation or nothing.
 @inline function _trial_factor_guided(ax_b::T, gx::T, n_orig::BigInt, ctx::MPQSContext,
                                large_prime_bound::Int, dlp_bound::Int, dlp_bound_sq::Int,
                                sieve_pos::Int,
-                               starts1::Vector{Int}, starts2::Vector{Int},
+                               offset1::Vector{Int}, offset2::Vector{Int},
                                a_indices::Vector{Int},
                                exponents::BitVector, full_exp::Vector{Int32}
                                )::Union{SmoothRelation, Nothing} where {T<:Integer}
@@ -225,11 +225,13 @@ Returns a SmoothRelation or nothing.
     end
 
     early_exit_j = fb_size + 1  # sentinel: no early exit
+    # Roots are 0-based (sieve position offset+1), so compare against sieve_pos - 1.
+    pos0 = sieve_pos - 1
     @inbounds for j in 1:fb_size
         p = fb[j]
         pT = T(p)
-        s1 = starts1[j]
-        if s1 == 0
+        o1 = offset1[j]
+        if o1 < 0
             # Prime with no stored sieve position — brute force check
             q, r = divrem(remainder, pT)
             if iszero(r)
@@ -252,10 +254,10 @@ Returns a SmoothRelation or nothing.
             end
             continue
         end
-        hit = (rem(sieve_pos - s1, p) == 0)
+        hit = (rem(pos0 - o1, p) == 0)
         if !hit
-            s2 = starts2[j]
-            hit = (s2 != s1) && (rem(sieve_pos - s2, p) == 0)
+            o2 = offset2[j]
+            hit = (o2 != o1) && (rem(pos0 - o2, p) == 0)
         end
         hit || continue
 
@@ -600,58 +602,40 @@ function _shift_roots!(offset1::Vector{Int}, offset2::Vector{Int}, delta::Vector
     end
 end
 
+# Subtract logp from every sieve position in the arithmetic progression pos, pos+p, ...
+@inline function _sieve_stride!(sieve::Vector{UInt8}, sieve_len::Int, pos::Int,
+                                p::Int, logp::UInt8)
+    @inbounds while pos <= sieve_len
+        sieve[pos] -= logp
+        pos += p
+    end
+end
+
 """
 Fast SIQS sieve: constant initialization (fill!) + unclamped subtraction + small prime skipping.
 """
 function _siqs_sieve!(sieve::Vector{UInt8}, sieve_len::Int,
                       offset1::Vector{Int}, offset2::Vector{Int},
-                      starts1::Vector{Int}, starts2::Vector{Int},
                       factor_base::Vector{Int}, log_primes::Vector{UInt8},
                       fb_size::Int, sieve_start_idx::Int, log_init::UInt8)
     fill!(sieve, log_init)
 
-    @inbounds for j in 1:fb_size
-        if offset1[j] < 0
-            starts1[j] = 0; starts2[j] = 0
-        else
-            starts1[j] = offset1[j] + 1
-            starts2[j] = offset2[j] + 1
-        end
-    end
-
     @inbounds for j in sieve_start_idx:fb_size
         p = factor_base[j]
         logp = log_primes[j]
-        s1 = starts1[j]
-        s1 <= 0 && continue
+        o1 = offset1[j]
+        o1 < 0 && continue   # p | a and 2b ≡ 0 (mod p): no root at all
 
-        s2 = starts2[j]
-        if s2 != s1 && s2 > 0
-            # Two distinct roots: interleave writes for memory-level parallelism
-            pos1 = s1
-            pos2 = s2
-            while pos1 <= sieve_len && pos2 <= sieve_len
-                sieve[pos1] -= logp
-                sieve[pos2] -= logp
-                pos1 += p
-                pos2 += p
-            end
-            while pos1 <= sieve_len
-                sieve[pos1] -= logp
-                pos1 += p
-            end
-            while pos2 <= sieve_len
-                sieve[pos2] -= logp
-                pos2 += p
-            end
-        else
-            # Single root (p | a)
-            pos = s1
-            while pos <= sieve_len
-                sieve[pos] -= logp
-                pos += p
-            end
-        end
+        # Each root gets the same plain stride walk. Interleaving the two walks into one
+        # loop was measurably worse above 40 digits (0.93-0.98x): the streams are already
+        # independent, so the core overlaps them across separate loops anyway, while the
+        # joint `pos1 <= && pos2 <=` gate costs a compare per iteration on the small
+        # primes that dominate the write count.
+        _sieve_stride!(sieve, sieve_len, o1 + 1, p, logp)
+        # o2 == o1 is exactly the p | a single-root case, which must not be subtracted
+        # twice. The offsets are always written as a pair, so o2 >= 0 follows from o1 >= 0.
+        o2 = offset2[j]
+        o2 == o1 || _sieve_stride!(sieve, sieve_len, o2 + 1, p, logp)
     end
 end
 
@@ -660,7 +644,7 @@ Collect smooth candidates from sieve. Candidates are positions where the sieve
 value underflowed (>= 0x80), indicating sufficient factorization over the factor base.
 """
 function _siqs_collect!(a::T, b::T, c::T, a_factors::Vector{Int}, ctx::MPQSContext,
-                        sieve::Vector{UInt8}, starts1::Vector{Int}, starts2::Vector{Int},
+                        sieve::Vector{UInt8}, offset1::Vector{Int}, offset2::Vector{Int},
                         relations::Vector{SmoothRelation},
                         partial_relations::Dict{Int, SmoothRelation},
                         M::Int, large_prime_bound::Int, dlp_bound::Int, dlp_bound_sq::Int,
@@ -683,7 +667,7 @@ function _siqs_collect!(a::T, b::T, c::T, a_factors::Vector{Int}, ctx::MPQSConte
             sieve[i] < 0x80 && continue
             _process_candidate!(i, a, b, c, M, ctx,
                                 large_prime_bound, dlp_bound, dlp_bound_sq,
-                                starts1, starts2, a_factors,
+                                offset1, offset2, a_factors,
                                 tf_exponents, tf_full_exp,
                                 relations, partial_relations)
         end
@@ -696,7 +680,7 @@ Process a single sieve candidate at position `i`.
 @inline function _process_candidate!(i::Int, a::T, b::T, c::T, M::Int,
                              ctx::MPQSContext,
                              large_prime_bound::Int, dlp_bound::Int, dlp_bound_sq::Int,
-                             starts1::Vector{Int}, starts2::Vector{Int},
+                             offset1::Vector{Int}, offset2::Vector{Int},
                              a_factors::Vector{Int},
                              tf_exponents::BitVector, tf_full_exp::Vector{Int32},
                              relations::Vector{SmoothRelation},
@@ -710,7 +694,7 @@ Process a single sieve candidate at position `i`.
 
     relation = _trial_factor_guided(ax_b, gx, ctx.n_orig, ctx,
                                     large_prime_bound, dlp_bound, dlp_bound_sq,
-                                    i, starts1, starts2,
+                                    i, offset1, offset2,
                                     a_factors,
                                     tf_exponents, tf_full_exp)
     relation === nothing && return
@@ -783,11 +767,11 @@ function mpqs_factor(n::Integer)
     # refused rather than looped on. A prime has no split, and x² ≡ y² (mod p^e) does
     # not reliably find one for a perfect power. `eachfactor` excludes both already.
     nb > 3 || throw(ArgumentError("mpqs_factor needs n > 3, got $n"))
-    isprime(nb) && throw(ArgumentError("mpqs_factor needs a composite n, got the prime $n"))
-    ispower(nb) && throw(ArgumentError("mpqs_factor cannot reliably split the perfect power $n; factor its root"))
-    k = _select_knuth_multiplier(nb)
-    kn = BigInt(k) * nb
-    fb_size_target, sieve_interval = _mpqs_select_params(nb)
+    isprime(n) && throw(ArgumentError("mpqs_factor needs a composite n, got the prime $n"))
+    ispower(n) && throw(ArgumentError("mpqs_factor cannot reliably split the perfect power $n; factor its root"))
+    k = _select_knuth_multiplier(n)
+    kn = BigInt(k) * n
+    fb_size_target, sieve_interval = _mpqs_select_params(n)
     width = ndigits(isqrt(2 * kn), base=2) + ndigits(sieve_interval, base=2) + 4
     return width <= 126 ?
         _mpqs_factor(Int128, nb, k, kn, fb_size_target, sieve_interval) :
@@ -811,8 +795,6 @@ function _mpqs_factor(::Type{T}, n::BigInt, k::Int, kn::BigInt,
 
     # Preallocate buffers (reused across all polynomials)
     sieve = Vector{UInt8}(undef, sieve_len)
-    starts1 = Vector{Int}(undef, actual_fb_size)
-    starts2 = Vector{Int}(undef, actual_fb_size)
     offset1 = Vector{Int}(undef, actual_fb_size)
     offset2 = Vector{Int}(undef, actual_fb_size)
 
@@ -890,9 +872,9 @@ function _mpqs_factor(::Type{T}, n::BigInt, k::Int, kn::BigInt,
                               sqrt_kn_mod, factor_base, actual_fb_size, M)
 
         # First polynomial
-        _siqs_sieve!(sieve, sieve_len, offset1, offset2, starts1, starts2,
+        _siqs_sieve!(sieve, sieve_len, offset1, offset2,
                      factor_base, log_primes, actual_fb_size, sieve_start_idx, log_init)
-        _siqs_collect!(a, b, c, a_indices, ctx, sieve, starts1, starts2,
+        _siqs_collect!(a, b, c, a_indices, ctx, sieve, offset1, offset2,
                        relations, partial_relations, M, large_prime_bound,
                        dlp_bound, dlp_bound_sq,
                        tf_exponents, tf_full_exp)
@@ -919,9 +901,9 @@ function _mpqs_factor(::Type{T}, n::BigInt, k::Int, kn::BigInt,
             end
 
             # Sieve and collect
-            _siqs_sieve!(sieve, sieve_len, offset1, offset2, starts1, starts2,
+            _siqs_sieve!(sieve, sieve_len, offset1, offset2,
                          factor_base, log_primes, actual_fb_size, sieve_start_idx, log_init)
-            _siqs_collect!(a, b, c, a_indices, ctx, sieve, starts1, starts2,
+            _siqs_collect!(a, b, c, a_indices, ctx, sieve, offset1, offset2,
                            relations, partial_relations, M, large_prime_bound,
                            dlp_bound, dlp_bound_sq,
                            tf_exponents, tf_full_exp)
