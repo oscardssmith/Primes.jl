@@ -524,16 +524,7 @@ function _compute_siqs_roots!(offset1::Vector{Int}, offset2::Vector{Int},
     @inbounds for j in 1:fb_size
         p = factor_base[j]
         if inv_a[j] == 0
-            b2_mod_p = mod(2 * Int(mod(b, p)), p)
-            c_mod_p = Int(mod(c, p))
-            if b2_mod_p == 0
-                offset1[j] = -1; offset2[j] = -1
-            else
-                b_inv = invmod(b2_mod_p, p)
-                r = mod(-c_mod_p * b_inv, p)
-                o = mod(r + M, p)
-                offset1[j] = o; offset2[j] = o
-            end
+            _set_single_root!(offset1, offset2, j, p, b, c, M)
         else
             sqr = sqrt_kn_mod[j]
             b_mod_p = Int(mod(b, p))
@@ -542,6 +533,69 @@ function _compute_siqs_roots!(offset1::Vector{Int}, offset2::Vector{Int},
             r2 = mod((-sqr - b_mod_p) * ai, p)
             offset1[j] = mod(r1 + M, p)
             offset2[j] = mod(r2 + M, p)
+        end
+    end
+end
+
+# For p | a, Q(x)/a is linear mod p — 2b·x + c — so it has one root, not two.
+# -1 in both offsets marks "no root at all", when 2b vanishes mod p as well.
+@inline function _set_single_root!(offset1::Vector{Int}, offset2::Vector{Int},
+                                   j::Int, p::Int, b::Integer, c::Integer, M::Int)
+    b2 = mod(2 * Int(mod(b, p)), p)
+    if b2 == 0
+        offset1[j] = -1
+        offset2[j] = -1
+    else
+        o = mod(mod(-Int(mod(c, p)) * invmod(b2, p), p) + M, p)
+        offset1[j] = o
+        offset2[j] = o
+    end
+end
+
+# inv(a) mod p for every factor base prime, taken from a's known factorization so no
+# division by a BigInt is needed. 0 marks the primes that divide a.
+function _precompute_inv_a!(inv_a::Vector{Int}, factor_base::Vector{Int},
+                            fb_size::Int, a_indices::Vector{Int})
+    @inbounds for j in 1:fb_size
+        p = factor_base[j]
+        a_mod_p = 1
+        for idx in a_indices
+            if factor_base[idx] == p
+                a_mod_p = 0
+                break
+            end
+            a_mod_p = mod(a_mod_p * mod(factor_base[idx], p), p)
+        end
+        inv_a[j] = a_mod_p == 0 ? 0 : invmod(a_mod_p, p)
+    end
+end
+
+# B_delta[v][j] = 2·B_v·inv(a) mod p: how far prime j's roots move when the sign of B_v
+# flips. Precomputing these is what makes the Gray-code walk over b-values cheap.
+function _precompute_b_deltas!(B_delta::Vector{Vector{Int}}, B_comps::Vector,
+                               inv_a::Vector{Int}, factor_base::Vector{Int}, fb_size::Int)
+    for (v, Bv) in enumerate(B_comps)
+        delta = B_delta[v]
+        @inbounds for j in 1:fb_size
+            p = factor_base[j]
+            delta[j] = mod(2 * Int(mod(Bv, p)) * inv_a[j], p)
+        end
+    end
+end
+
+# Slide every two-root prime's offsets by ±delta, the Gray-code step between b-values.
+function _shift_roots!(offset1::Vector{Int}, offset2::Vector{Int}, delta::Vector{Int},
+                       inv_a::Vector{Int}, factor_base::Vector{Int}, fb_size::Int, forward::Bool)
+    @inbounds for j in 1:fb_size
+        inv_a[j] == 0 && continue
+        p = factor_base[j]
+        d = delta[j]
+        if forward
+            o1 = offset1[j] + d; o1 >= p && (o1 -= p); offset1[j] = o1
+            o2 = offset2[j] + d; o2 >= p && (o2 -= p); offset2[j] = o2
+        else
+            o1 = offset1[j] - d; o1 < 0 && (o1 += p); offset1[j] = o1
+            o2 = offset2[j] - d; o2 < 0 && (o2 += p); offset2[j] = o2
         end
     end
 end
@@ -819,36 +873,8 @@ function _mpqs_factor(::Type{T}, n::BigInt, k::Int, kn::BigInt,
             push!(B_delta, Vector{Int}(undef, actual_fb_size))
         end
 
-        # Precompute inv(a) mod p using factored form (avoids GMP BigInt mod)
-        # a = prod(factor_base[idx] for idx in a_indices)
-        @inbounds for j in 1:actual_fb_size
-            p = factor_base[j]
-            a_mod_p = 1
-            for idx in a_indices
-                if factor_base[idx] == p
-                    a_mod_p = 0
-                    break
-                end
-                a_mod_p = mod(a_mod_p * mod(factor_base[idx], p), p)
-            end
-            if a_mod_p == 0
-                inv_a[j] = 0
-            else
-                inv_a[j] = invmod(a_mod_p, p)
-            end
-        end
-
-        # Precompute root deltas for incremental Gray code b-switching
-        # B_delta[v][j] = 2 * B_v mod p * inv_a[j] mod p
-        for v in 1:s
-            Bv = B_comps[v]
-            delta = B_delta[v]
-            @inbounds for j in 1:actual_fb_size
-                p = factor_base[j]
-                Bv_mod_p = Int(mod(Bv, p))
-                delta[j] = mod(2 * Bv_mod_p * inv_a[j], p)
-            end
-        end
+        _precompute_inv_a!(inv_a, factor_base, actual_fb_size, a_indices)
+        _precompute_b_deltas!(B_delta, B_comps, inv_a, factor_base, actual_fb_size)
 
         # Initial b (all positive CRT signs)
         b = mod(sum(B_comps), a)
@@ -881,47 +907,15 @@ function _mpqs_factor(::Type{T}, n::BigInt, k::Int, kn::BigInt,
             gray_curr = (i - 1) ⊻ ((i - 1) >> 1)
             flip_bit = trailing_zeros(gray_prev ⊻ gray_curr) + 1
 
-            if (gray_curr >> (flip_bit - 1)) & 1 == 1
-                b = mod(b - 2 * B_comps[flip_bit], a)
-                dd = +1  # roots shift right
-            else
-                b = mod(b + 2 * B_comps[flip_bit], a)
-                dd = -1  # roots shift left
-            end
+            forward = (gray_curr >> (flip_bit - 1)) & 1 == 1
+            b = mod(forward ? b - 2 * B_comps[flip_bit] : b + 2 * B_comps[flip_bit], a)
+            _shift_roots!(offset1, offset2, B_delta[flip_bit], inv_a,
+                          factor_base, actual_fb_size, forward)
 
-            # Incremental root update (pure Int arithmetic, no BigInt mod)
-            delta = B_delta[flip_bit]
-            @inbounds for j in 1:actual_fb_size
-                inv_a[j] == 0 && continue
-                p = factor_base[j]
-                d = delta[j]
-                if dd > 0
-                    o1 = offset1[j] + d; if o1 >= p; o1 -= p; end
-                    offset1[j] = o1
-                    o2 = offset2[j] + d; if o2 >= p; o2 -= p; end
-                    offset2[j] = o2
-                else
-                    o1 = offset1[j] - d; if o1 < 0; o1 += p; end
-                    offset1[j] = o1
-                    o2 = offset2[j] - d; if o2 < 0; o2 += p; end
-                    offset2[j] = o2
-                end
-            end
-
-            # Recompute roots for primes dividing a (~s primes)
+            # The primes dividing a are not shifted, so re-derive their single roots.
             c = T(div(widemul(b, b) - kn, a))
             for idx in a_indices
-                p = factor_base[idx]
-                b2_mod_p = mod(2 * Int(mod(b, p)), p)
-                c_mod_p = Int(mod(c, p))
-                if b2_mod_p == 0
-                    offset1[idx] = -1; offset2[idx] = -1
-                else
-                    b_inv = invmod(b2_mod_p, p)
-                    r = mod(-c_mod_p * b_inv, p)
-                    o = mod(r + M, p)
-                    offset1[idx] = o; offset2[idx] = o
-                end
+                _set_single_root!(offset1, offset2, idx, factor_base[idx], b, c, M)
             end
 
             # Sieve and collect
